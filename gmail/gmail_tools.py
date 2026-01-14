@@ -255,13 +255,18 @@ def _generate_gmail_web_url(item_id: str, account_index: int = 0) -> str:
     return f"https://mail.google.com/mail/u/{account_index}/#all/{item_id}"
 
 
-def _format_gmail_results_plain(messages: list, query: str) -> str:
+def _format_gmail_results_plain(messages: list, query: str, next_page_token: Optional[str] = None, result_size_estimate: Optional[int] = None) -> str:
     """Format Gmail search results in clean, LLM-friendly plain text."""
     if not messages:
         return f"No messages found for query: '{query}'"
 
+    # Show estimate if available
+    estimate_info = ""
+    if result_size_estimate and result_size_estimate > len(messages):
+        estimate_info = f" (estimated {result_size_estimate} total)"
+
     lines = [
-        f"Found {len(messages)} messages matching '{query}':",
+        f"Found {len(messages)} messages{estimate_info} matching '{query}':",
         "",
         "📧 MESSAGES:",
     ]
@@ -315,6 +320,15 @@ def _format_gmail_results_plain(messages: list, query: str) -> str:
         ]
     )
 
+    # Add pagination info if there are more results
+    if next_page_token:
+        lines.extend([
+            "",
+            "📄 PAGINATION:",
+            f"  • More results available. Use page_token='{next_page_token}' to get next page.",
+            "  • Example: search_gmail_messages(query='...', page_token='...')",
+        ])
+
     return "\n".join(lines)
 
 
@@ -322,30 +336,58 @@ def _format_gmail_results_plain(messages: list, query: str) -> str:
 @handle_http_errors("search_gmail_messages", is_read_only=True, service_type="gmail")
 @require_google_service("gmail", "gmail_read")
 async def search_gmail_messages(
-    service, query: str, user_google_email: str, page_size: int = 10
+    service,
+    query: str,
+    user_google_email: str,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
 ) -> str:
     """
     Searches messages in a user's Gmail account based on a query.
     Returns both Message IDs and Thread IDs for each found message, along with Gmail web interface links for manual verification.
+    Supports pagination for retrieving large result sets.
 
     Args:
         query (str): The search query. Supports standard Gmail search operators.
+            Examples:
+            - "from:user@example.com" - emails from a specific sender
+            - "after:2024/01/01 before:2024/03/01" - emails in a date range
+            - "subject:meeting" - emails with 'meeting' in subject
+            - "has:attachment" - emails with attachments
+            - "is:unread" - unread emails
         user_google_email (str): The user's Google email address. Required.
-        page_size (int): The maximum number of messages to return. Defaults to 10.
+        page_size (int): The maximum number of messages to return per page. Defaults to 100. Max is 500.
+        page_token (str, optional): Token for retrieving the next page of results.
+            Use the page_token from a previous response to get more results.
 
     Returns:
-        str: LLM-friendly structured results with Message IDs, Thread IDs, and clickable Gmail web interface URLs for each found message.
+        str: LLM-friendly structured results with Message IDs, Thread IDs, clickable Gmail web interface URLs,
+             and pagination token if more results are available.
     """
     logger.info(
-        f"[search_gmail_messages] Email: '{user_google_email}', Query: '{query}'"
+        f"[search_gmail_messages] Email: '{user_google_email}', Query: '{query}', PageSize: {page_size}, HasPageToken: {page_token is not None}"
     )
 
-    response = await asyncio.to_thread(
-        service.users()
-        .messages()
-        .list(userId="me", q=query, maxResults=page_size)
-        .execute
+    # Cap page_size at 500 (Gmail API limit)
+    effective_page_size = min(page_size, 500)
+
+    # Build the API request
+    list_request = service.users().messages().list(
+        userId="me",
+        q=query,
+        maxResults=effective_page_size
     )
+
+    # Add page token if provided for pagination
+    if page_token:
+        list_request = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=effective_page_size,
+            pageToken=page_token
+        )
+
+    response = await asyncio.to_thread(list_request.execute)
 
     # Handle potential null response (but empty dict {} is valid)
     if response is None:
@@ -357,9 +399,21 @@ async def search_gmail_messages(
     if messages is None:
         messages = []
 
-    formatted_output = _format_gmail_results_plain(messages, query)
+    # Extract pagination info
+    next_page_token = response.get("nextPageToken")
+    result_size_estimate = response.get("resultSizeEstimate")
 
-    logger.info(f"[search_gmail_messages] Found {len(messages)} messages")
+    formatted_output = _format_gmail_results_plain(
+        messages,
+        query,
+        next_page_token=next_page_token,
+        result_size_estimate=result_size_estimate
+    )
+
+    logger.info(
+        f"[search_gmail_messages] Found {len(messages)} messages, "
+        f"hasMore: {next_page_token is not None}, estimate: {result_size_estimate}"
+    )
     return formatted_output
 
 
