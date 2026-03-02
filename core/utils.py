@@ -295,6 +295,13 @@ def handle_http_errors(tool_name: str, is_read_only: bool = False, service_type:
                                 f"The required API is not enabled for your project. "
                                 f"Please check the Google Cloud Console to enable it."
                             )
+                    elif error.resp.status == 404:
+                        # Not Found — often caused by invalid thread_id or message_id
+                        message = (
+                            f"API error in {tool_name}: {error}. "
+                            f"The requested resource was not found. If a thread_id or message_id was provided, "
+                            f"it may be invalid, deleted, or belong to a different account."
+                        )
                     elif error.resp.status in [401, 403]:
                         # Authentication/authorization errors
                         message = (

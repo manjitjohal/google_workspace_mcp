@@ -15,6 +15,8 @@ from email.mime.text import MIMEText
 from fastapi import Body
 from pydantic import Field
 
+from googleapiclient.errors import HttpError
+
 from auth.service_decorator import require_google_service
 from core.utils import handle_http_errors
 from core.server import server
@@ -943,16 +945,35 @@ async def draft_gmail_message(
     # Create a draft instead of sending
     draft_body = {"message": {"raw": raw_message}}
 
-    # Associate with thread if provided
+    # Associate with thread if provided — validate thread exists first
     if thread_id_final:
-        draft_body["message"]["threadId"] = thread_id_final
+        try:
+            await asyncio.to_thread(
+                service.users().threads().get(userId="me", id=thread_id_final, format="minimal").execute
+            )
+        except HttpError as e:
+            if e.resp.status == 404:
+                logger.warning(
+                    f"[draft_gmail_message] thread_id '{thread_id_final}' not found, creating draft without thread association"
+                )
+                thread_id_final = None
+            else:
+                raise
+        if thread_id_final:
+            draft_body["message"]["threadId"] = thread_id_final
 
     # Create the draft
     created_draft = await asyncio.to_thread(
         service.users().drafts().create(userId="me", body=draft_body).execute
     )
     draft_id = created_draft.get("id")
-    return f"Draft created! Draft ID: {draft_id}"
+    thread_note = ""
+    if thread_id and not thread_id_final:
+        thread_note = (
+            f" Note: the provided thread_id '{thread_id}' was not found, "
+            "so the draft was created as a standalone email instead of a reply."
+        )
+    return f"Draft created! Draft ID: {draft_id}{thread_note}"
 
 
 def _format_thread_content(thread_data: dict, thread_id: str) -> str:
