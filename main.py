@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import signal
 import socket
 import sys
 from importlib import metadata, import_module
@@ -277,7 +278,28 @@ def main():
                 safe_print(f"❌ Port {port} is already in use. Cannot start HTTP server.")
                 sys.exit(1)
 
-            server.run(transport="streamable-http", host="0.0.0.0", port=port)
+            # Use uvicorn directly to set timeout_graceful_shutdown.
+            # This prevents "ASGI callable returned without completing response"
+            # errors when open SSE connections exist during shutdown (e.g., Railway redeploy).
+            # See: https://github.com/modelcontextprotocol/python-sdk/issues/1272
+            import uvicorn
+
+            app = server.streamable_http_app()
+
+            # Register SIGTERM handler to trigger clean session shutdown
+            # before uvicorn force-closes connections
+            def _handle_sigterm(signum, frame):
+                logger.info("Received SIGTERM, initiating graceful shutdown...")
+                raise KeyboardInterrupt
+
+            signal.signal(signal.SIGTERM, _handle_sigterm)
+
+            uvicorn.run(
+                app,
+                host="0.0.0.0",
+                port=port,
+                timeout_graceful_shutdown=5,
+            )
         else:
             server.run()
     except KeyboardInterrupt:
