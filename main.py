@@ -284,7 +284,7 @@ def main():
             # See: https://github.com/modelcontextprotocol/python-sdk/issues/1272
             import uvicorn
 
-            app = server.streamable_http_app()
+            app = server.http_app()
 
             # Register SIGTERM handler to trigger clean session shutdown
             # before uvicorn force-closes connections
