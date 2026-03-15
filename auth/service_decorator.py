@@ -658,16 +658,25 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
     def decorator(func: Callable) -> Callable:
         original_sig = inspect.signature(func)
 
-        # In OAuth 2.1 mode, remove user_google_email from the signature
+        # Collect injected service parameter names so we can strip them from the
+        # public (MCP-visible) signature — these are populated by the decorator,
+        # not by the caller.
+        injected_param_names = {cfg["param_name"] for cfg in service_configs}
+
+        params = list(original_sig.parameters.values())
         if is_oauth21_enabled():
-            params = list(original_sig.parameters.values())
+            # Remove injected service params AND user_google_email
             filtered_params = [
                 p for p in params
-                if p.name != 'user_google_email'
+                if p.name not in injected_param_names and p.name != 'user_google_email'
             ]
-            wrapper_sig = original_sig.replace(parameters=filtered_params)
         else:
-            wrapper_sig = original_sig
+            # Remove only injected service params
+            filtered_params = [
+                p for p in params
+                if p.name not in injected_param_names
+            ]
+        wrapper_sig = original_sig.replace(parameters=filtered_params)
 
         @wraps(func)
         async def wrapper(*args, **kwargs):
