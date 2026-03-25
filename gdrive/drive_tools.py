@@ -129,9 +129,9 @@ async def get_drive_file_content(
     }.get(mime_type)
 
     request_obj = (
-        service.files().export_media(fileId=file_id, mimeType=export_mime_type, supportsAllDrives=True)
+        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
         if export_mime_type
-        else service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        else service.files().get_media(fileId=file_id)
     )
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request_obj)
@@ -235,6 +235,46 @@ async def list_drive_items(
         )
     text_output = "\n".join(formatted_items_text_parts)
     return text_output
+
+@server.tool()
+@handle_http_errors("create_drive_folder", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def create_drive_folder(
+    service,
+    user_google_email: str,
+    folder_name: str,
+    parent_folder_id: str = 'root',
+) -> str:
+    """
+    Creates a new folder in Google Drive.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        folder_name (str): The name for the new folder.
+        parent_folder_id (str): The ID of the parent folder. Defaults to 'root' (top level of My Drive).
+
+    Returns:
+        str: Confirmation message with folder ID and link.
+    """
+    logger.info(f"[create_drive_folder] Invoked. Email: '{user_google_email}', Folder: '{folder_name}', Parent: '{parent_folder_id}'")
+
+    folder_metadata = {
+        'name': folder_name,
+        'mimeType': 'application/vnd.google-apps.folder',
+        'parents': [parent_folder_id]
+    }
+
+    created_folder = await asyncio.to_thread(
+        service.files().create(
+            body=folder_metadata,
+            fields='id, name, webViewLink',
+            supportsAllDrives=True
+        ).execute
+    )
+
+    logger.info(f"[create_drive_folder] Created folder '{folder_name}' (ID: {created_folder['id']})")
+    return f"Successfully created folder '{folder_name}' (ID: {created_folder['id']}). Link: {created_folder.get('webViewLink', 'N/A')}"
+
 
 @server.tool()
 @handle_http_errors("create_drive_file", service_type="drive")
