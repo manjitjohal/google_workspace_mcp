@@ -314,6 +314,7 @@ def _format_gmail_results_plain(messages: list, query: str, next_page_token: Opt
         if has_metadata:
             subject = msg.get("subject", "")
             sender = msg.get("from", "")
+            recipient = msg.get("to", "")
             date = msg.get("date", "")
             snippet = msg.get("snippet", "")
             label_ids = msg.get("labelIds", [])
@@ -322,6 +323,8 @@ def _format_gmail_results_plain(messages: list, query: str, next_page_token: Opt
                 entry_lines.append(f"     Subject: {subject}")
             if sender:
                 entry_lines.append(f"     From: {sender}")
+            if recipient:
+                entry_lines.append(f"     To: {recipient}")
             if date:
                 entry_lines.append(f"     Date: {date}")
             if label_ids:
@@ -474,31 +477,34 @@ async def search_gmail_messages(
 
                 await asyncio.to_thread(batch.execute)
 
-                # Merge metadata into message objects
-                for msg in chunk:
-                    mid = msg.get("id")
-                    entry = batch_results.get(mid)
-                    if entry and entry.get("data") and not entry.get("error"):
-                        meta = entry["data"]
-                        headers = {
-                            h["name"]: h["value"]
-                            for h in meta.get("payload", {}).get("headers", [])
-                        }
-                        msg["subject"] = headers.get("Subject", "")
-                        msg["from"] = headers.get("From", "")
-                        msg["to"] = headers.get("To", "")
-                        msg["date"] = headers.get("Date", "")
-                        msg["snippet"] = meta.get("snippet", "")
-                        msg["labelIds"] = meta.get("labelIds", [])
-                        msg["sizeEstimate"] = meta.get("sizeEstimate", 0)
-                    enriched_messages.append(msg)
-
             except Exception as batch_error:
                 logger.warning(
                     f"[search_gmail_messages] Metadata batch failed, returning IDs only: {batch_error}"
                 )
-                # Fall back to raw messages (IDs only)
+                # Fall back: add raw messages (IDs only) and move to next chunk.
+                # This is kept separate from the merge loop below so a batch.execute
+                # failure cannot cause partial appends followed by a full extend (double-count).
                 enriched_messages.extend(chunk)
+                continue
+
+            # Merge metadata into message objects - only reached if batch.execute succeeded
+            for msg in chunk:
+                mid = msg.get("id")
+                entry = batch_results.get(mid)
+                if entry and entry.get("data") and not entry.get("error"):
+                    meta = entry["data"]
+                    headers = {
+                        h["name"]: h["value"]
+                        for h in meta.get("payload", {}).get("headers", [])
+                    }
+                    msg["subject"] = headers.get("Subject", "")
+                    msg["from"] = headers.get("From", "")
+                    msg["to"] = headers.get("To", "")
+                    msg["date"] = headers.get("Date", "")
+                    msg["snippet"] = meta.get("snippet", "")
+                    msg["labelIds"] = meta.get("labelIds", [])
+                    msg["sizeEstimate"] = meta.get("sizeEstimate", 0)
+                enriched_messages.append(msg)
 
         messages = enriched_messages
 
