@@ -267,6 +267,9 @@ def _format_gmail_results_plain(messages: list, query: str, next_page_token: Opt
     if result_size_estimate and result_size_estimate > len(messages):
         estimate_info = f" (estimated {result_size_estimate} total)"
 
+    # Check if messages have enriched metadata
+    has_metadata = any(msg.get("subject") or msg.get("from") for msg in messages if isinstance(msg, dict))
+
     lines = [
         f"Found {len(messages)} messages{estimate_info} matching '{query}':",
         "",
@@ -303,24 +306,59 @@ def _format_gmail_results_plain(messages: list, query: str, next_page_token: Opt
         else:
             thread_url = "N/A"
 
+        # Build message entry — include metadata if available
+        entry_lines = [
+            f"  {i}. Message ID: {message_id}",
+        ]
+
+        if has_metadata:
+            subject = msg.get("subject", "")
+            sender = msg.get("from", "")
+            recipient = msg.get("to", "")
+            date = msg.get("date", "")
+            snippet = msg.get("snippet", "")
+            label_ids = msg.get("labelIds", [])
+
+            if subject:
+                entry_lines.append(f"     Subject: {subject}")
+            if sender:
+                entry_lines.append(f"     From: {sender}")
+            if recipient:
+                entry_lines.append(f"     To: {recipient}")
+            if date:
+                entry_lines.append(f"     Date: {date}")
+            if label_ids:
+                entry_lines.append(f"     Labels: {', '.join(label_ids)}")
+            if snippet:
+                entry_lines.append(f"     Snippet: {snippet}")
+
+        entry_lines.extend([
+            f"     Web Link: {message_url}",
+            f"     Thread ID: {thread_id}",
+            f"     Thread Link: {thread_url}",
+            "",
+        ])
+
+        lines.extend(entry_lines)
+
+    if has_metadata:
         lines.extend(
             [
-                f"  {i}. Message ID: {message_id}",
-                f"     Web Link: {message_url}",
-                f"     Thread ID: {thread_id}",
-                f"     Thread Link: {thread_url}",
-                "",
+                "💡 USAGE:",
+                "  • These results include metadata (subject, from, snippet, labels) for fast triage.",
+                "  • For full email body content, pass Message IDs to get_gmail_messages_content_batch(message_ids=[...])",
+                "  • To label/archive/delete, use batch_modify_gmail_message_labels() or modify_gmail_message_labels()",
             ]
         )
-
-    lines.extend(
-        [
-            "💡 USAGE:",
-            "  • Pass the Message IDs **as a list** to get_gmail_messages_content_batch()",
-            "    e.g. get_gmail_messages_content_batch(message_ids=[...])",
-            "  • Pass the Thread IDs to get_gmail_thread_content() (single) or get_gmail_threads_content_batch() (batch)",
-        ]
-    )
+    else:
+        lines.extend(
+            [
+                "💡 USAGE:",
+                "  • Pass the Message IDs **as a list** to get_gmail_messages_content_batch()",
+                "    e.g. get_gmail_messages_content_batch(message_ids=[...])",
+                "  • Pass the Thread IDs to get_gmail_thread_content() (single) or get_gmail_threads_content_batch() (batch)",
+            ]
+        )
 
     # Add pagination info if there are more results
     if next_page_token:
@@ -404,6 +442,71 @@ async def search_gmail_messages(
     # Extract pagination info
     next_page_token = response.get("nextPageToken")
     result_size_estimate = response.get("resultSizeEstimate")
+
+    # PERFORMANCE: Batch-fetch metadata for all messages in a single request.
+    # messages.list only returns IDs. Without this, the platform has to make N
+    # individual messages.get calls (the "hydration step") which is very slow.
+    # Gmail batch API supports up to 100 requests per batch call.
+    if messages:
+        enriched_messages = []
+        METADATA_BATCH_SIZE = 100  # Gmail batch API limit
+
+        for chunk_start in range(0, len(messages), METADATA_BATCH_SIZE):
+            chunk = messages[chunk_start : chunk_start + METADATA_BATCH_SIZE]
+            batch_results: Dict[str, Dict] = {}
+
+            def _meta_callback(request_id, response, exception):
+                batch_results[request_id] = {"data": response, "error": exception}
+
+            try:
+                batch = service.new_batch_http_request(callback=_meta_callback)
+                for msg in chunk:
+                    mid = msg.get("id")
+                    if mid:
+                        req = (
+                            service.users()
+                            .messages()
+                            .get(
+                                userId="me",
+                                id=mid,
+                                format="metadata",
+                                metadataHeaders=["Subject", "From", "To", "Date"],
+                            )
+                        )
+                        batch.add(req, request_id=mid)
+
+                await asyncio.to_thread(batch.execute)
+
+            except Exception as batch_error:
+                logger.warning(
+                    f"[search_gmail_messages] Metadata batch failed, returning IDs only: {batch_error}"
+                )
+                # Fall back: add raw messages (IDs only) and move to next chunk.
+                # This is kept separate from the merge loop below so a batch.execute
+                # failure cannot cause partial appends followed by a full extend (double-count).
+                enriched_messages.extend(chunk)
+                continue
+
+            # Merge metadata into message objects - only reached if batch.execute succeeded
+            for msg in chunk:
+                mid = msg.get("id")
+                entry = batch_results.get(mid)
+                if entry and entry.get("data") and not entry.get("error"):
+                    meta = entry["data"]
+                    headers = {
+                        h["name"]: h["value"]
+                        for h in meta.get("payload", {}).get("headers", [])
+                    }
+                    msg["subject"] = headers.get("Subject", "")
+                    msg["from"] = headers.get("From", "")
+                    msg["to"] = headers.get("To", "")
+                    msg["date"] = headers.get("Date", "")
+                    msg["snippet"] = meta.get("snippet", "")
+                    msg["labelIds"] = meta.get("labelIds", [])
+                    msg["sizeEstimate"] = meta.get("sizeEstimate", 0)
+                enriched_messages.append(msg)
+
+        messages = enriched_messages
 
     formatted_output = _format_gmail_results_plain(
         messages,
