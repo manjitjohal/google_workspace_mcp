@@ -935,9 +935,9 @@ async def bulk_delete_events(
 
     Args:
         user_google_email (str): The user's Google email address. Required.
-        time_min (Optional[str]): Start of time range (RFC3339). Defaults to 1970-01-01 (all past events).
-        time_max (Optional[str]): End of time range (RFC3339). If omitted, deletes up to far future.
-        query (Optional[str]): Keyword to filter events (searches summary, description, location).
+        time_min (Optional[str]): Start of time range (RFC3339). At least one of time_min, time_max, or query is required.
+        time_max (Optional[str]): End of time range (RFC3339). At least one of time_min, time_max, or query is required.
+        query (Optional[str]): Keyword to filter events (searches summary, description, location). At least one of time_min, time_max, or query is required.
         calendar_id (str): Calendar ID (default: 'primary').
 
     Returns:
@@ -948,7 +948,14 @@ async def bulk_delete_events(
         f"time_min: '{time_min}', time_max: '{time_max}', query: '{query}'"
     )
 
-    # Format time parameters — Calendar API requires timeMin when singleEvents=True + orderBy
+    # Safety guard - require at least one filter to prevent accidental full calendar wipe
+    if not time_min and not time_max and not query:
+        return (
+            "Error: at least one of time_min, time_max, or query must be provided. "
+            "Calling bulk_delete_events with no filters would delete all events on the calendar."
+        )
+
+    # Format time parameters - Calendar API requires timeMin when singleEvents=True + orderBy
     formatted_time_min = _correct_time_format_for_api(time_min, "time_min") or "1970-01-01T00:00:00Z"
     formatted_time_max = _correct_time_format_for_api(time_max, "time_max")
 
