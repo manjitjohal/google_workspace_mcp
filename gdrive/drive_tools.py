@@ -603,3 +603,227 @@ async def check_drive_file_public_access(
         ])
     
     return "\n".join(output_parts)
+
+
+@server.tool()
+@handle_http_errors("bulk_trash_drive_files", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def bulk_trash_drive_files(
+    service,
+    user_google_email: str,
+    query: str,
+    drive_id: Optional[str] = None,
+) -> str:
+    """
+    Moves multiple Google Drive files to trash based on a search query.
+    Handles pagination internally — ideal for bulk cleanup operations.
+
+    Examples:
+        - Trash old files: query="modifiedTime < '2024-01-01'"
+        - Trash by name pattern: query="name contains 'draft'"
+        - Trash specific type: query="mimeType='application/pdf' and modifiedTime < '2024-06-01'"
+        - Trash files in folder: query="'FOLDER_ID' in parents"
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        query (str): Google Drive search query to find files to trash.
+        drive_id (Optional[str]): ID of shared drive to search within.
+
+    Returns:
+        str: Confirmation with count of files trashed.
+    """
+    logger.info(
+        f"[bulk_trash_drive_files] Invoked. Email: '{user_google_email}', Query: '{query}'"
+    )
+
+    # Ensure we don't trash already-trashed files
+    safe_query = query
+    if "trashed" not in query.lower():
+        safe_query = f"({query}) and trashed=false"
+
+    # Collect all file IDs via pagination
+    all_files = []
+    page_token = None
+    page_count = 0
+
+    while True:
+        list_params = build_drive_list_params(
+            query=safe_query,
+            page_size=100,
+            drive_id=drive_id,
+            include_items_from_all_drives=True,
+        )
+        if page_token:
+            list_params["pageToken"] = page_token
+
+        results = await asyncio.to_thread(
+            service.files().list(**list_params).execute
+        )
+
+        files = results.get("files", [])
+        for f in files:
+            if f.get("id"):
+                all_files.append({"id": f["id"], "name": f.get("name", "Unknown")})
+
+        page_count += 1
+        page_token = results.get("nextPageToken")
+        logger.info(
+            f"[bulk_trash_drive_files] Page {page_count}: found {len(files)} files, "
+            f"total so far: {len(all_files)}"
+        )
+
+        if not page_token:
+            break
+
+    if not all_files:
+        return f"No files found matching query: '{query}'"
+
+    # Trash all files
+    trashed_count = 0
+    failed_count = 0
+
+    for file_info in all_files:
+        try:
+            await asyncio.to_thread(
+                service.files().update(
+                    fileId=file_info["id"],
+                    body={"trashed": True},
+                    supportsAllDrives=True,
+                ).execute
+            )
+            trashed_count += 1
+        except Exception as e:
+            logger.warning(
+                f"[bulk_trash_drive_files] Failed to trash '{file_info['name']}' "
+                f"({file_info['id']}): {e}"
+            )
+            failed_count += 1
+
+    logger.info(
+        f"[bulk_trash_drive_files] Done. Trashed: {trashed_count}, Failed: {failed_count}"
+    )
+
+    result = f"✅ Trashed {trashed_count} files matching query '{query}'"
+    if failed_count > 0:
+        result += f"\n⚠️ {failed_count} files could not be trashed."
+    return result
+
+
+@server.tool()
+@handle_http_errors("bulk_move_drive_files", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def bulk_move_drive_files(
+    service,
+    user_google_email: str,
+    query: str,
+    target_folder_id: str,
+    drive_id: Optional[str] = None,
+) -> str:
+    """
+    Moves multiple Google Drive files to a target folder based on a search query.
+    Handles pagination internally — ideal for bulk organization.
+
+    Examples:
+        - Move old docs to archive: query="modifiedTime < '2024-01-01'", target_folder_id="ARCHIVE_FOLDER_ID"
+        - Organize by type: query="mimeType='application/pdf'", target_folder_id="PDF_FOLDER_ID"
+        - Move from specific folder: query="'SOURCE_FOLDER_ID' in parents", target_folder_id="DEST_FOLDER_ID"
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        query (str): Google Drive search query to find files to move.
+        target_folder_id (str): The ID of the destination folder.
+        drive_id (Optional[str]): ID of shared drive to search within.
+
+    Returns:
+        str: Confirmation with count of files moved.
+    """
+    logger.info(
+        f"[bulk_move_drive_files] Invoked. Email: '{user_google_email}', "
+        f"Query: '{query}', Target: '{target_folder_id}'"
+    )
+
+    # Only move non-trashed files
+    safe_query = query
+    if "trashed" not in query.lower():
+        safe_query = f"({query}) and trashed=false"
+
+    # Collect all file IDs and their current parents via pagination
+    all_files = []
+    page_token = None
+    page_count = 0
+
+    while True:
+        list_params = {
+            "q": safe_query,
+            "pageSize": 100,
+            "fields": "nextPageToken, files(id, name, parents)",
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+        }
+        if drive_id:
+            list_params["driveId"] = drive_id
+            list_params["corpora"] = "drive"
+        if page_token:
+            list_params["pageToken"] = page_token
+
+        results = await asyncio.to_thread(
+            service.files().list(**list_params).execute
+        )
+
+        files = results.get("files", [])
+        for f in files:
+            if f.get("id"):
+                all_files.append({
+                    "id": f["id"],
+                    "name": f.get("name", "Unknown"),
+                    "parents": f.get("parents", []),
+                })
+
+        page_count += 1
+        page_token = results.get("nextPageToken")
+        logger.info(
+            f"[bulk_move_drive_files] Page {page_count}: found {len(files)} files, "
+            f"total so far: {len(all_files)}"
+        )
+
+        if not page_token:
+            break
+
+    if not all_files:
+        return f"No files found matching query: '{query}'"
+
+    # Move all files (remove from current parents, add to target)
+    moved_count = 0
+    failed_count = 0
+
+    for file_info in all_files:
+        try:
+            remove_parents = ",".join(file_info["parents"]) if file_info["parents"] else None
+            update_kwargs = {
+                "fileId": file_info["id"],
+                "addParents": target_folder_id,
+                "fields": "id, parents",
+                "supportsAllDrives": True,
+            }
+            if remove_parents:
+                update_kwargs["removeParents"] = remove_parents
+
+            await asyncio.to_thread(
+                service.files().update(**update_kwargs).execute
+            )
+            moved_count += 1
+        except Exception as e:
+            logger.warning(
+                f"[bulk_move_drive_files] Failed to move '{file_info['name']}' "
+                f"({file_info['id']}): {e}"
+            )
+            failed_count += 1
+
+    logger.info(
+        f"[bulk_move_drive_files] Done. Moved: {moved_count}, Failed: {failed_count}"
+    )
+
+    result = f"✅ Moved {moved_count} files to folder '{target_folder_id}' matching query '{query}'"
+    if failed_count > 0:
+        result += f"\n⚠️ {failed_count} files could not be moved."
+    return result

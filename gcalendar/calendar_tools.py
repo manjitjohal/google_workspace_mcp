@@ -911,3 +911,122 @@ async def delete_event(service, user_google_email: str, event_id: str, calendar_
     confirmation_message = f"Successfully deleted event (ID: {event_id}) from calendar '{calendar_id}' for {user_google_email}."
     logger.info(f"Event deleted successfully for {user_google_email}. ID: {event_id}")
     return confirmation_message
+
+
+@server.tool()
+@handle_http_errors("bulk_delete_events", service_type="calendar")
+@require_google_service("calendar", "calendar_events")
+async def bulk_delete_events(
+    service,
+    user_google_email: str,
+    time_min: Optional[str] = None,
+    time_max: Optional[str] = None,
+    query: Optional[str] = None,
+    calendar_id: str = "primary",
+) -> str:
+    """
+    Deletes multiple calendar events in bulk by time range and/or keyword search.
+    Handles pagination internally — ideal for bulk cleanup operations.
+
+    Examples:
+        - Delete all events before 2025: time_max="2025-01-01T00:00:00Z"
+        - Delete cancelled meetings: query="cancelled", time_min="2024-01-01"
+        - Delete events by organizer keyword: query="team standup", time_max="2025-06-01T00:00:00Z"
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        time_min (Optional[str]): Start of time range (RFC3339). Defaults to 1970-01-01 (all past events).
+        time_max (Optional[str]): End of time range (RFC3339). If omitted, deletes up to far future.
+        query (Optional[str]): Keyword to filter events (searches summary, description, location).
+        calendar_id (str): Calendar ID (default: 'primary').
+
+    Returns:
+        str: Confirmation with count of events deleted.
+    """
+    logger.info(
+        f"[bulk_delete_events] Invoked. Email: '{user_google_email}', "
+        f"time_min: '{time_min}', time_max: '{time_max}', query: '{query}'"
+    )
+
+    # Format time parameters — Calendar API requires timeMin when singleEvents=True + orderBy
+    formatted_time_min = _correct_time_format_for_api(time_min, "time_min") or "1970-01-01T00:00:00Z"
+    formatted_time_max = _correct_time_format_for_api(time_max, "time_max")
+
+    # Collect all event IDs via pagination
+    all_event_ids = []
+    page_token = None
+    page_count = 0
+
+    while True:
+        request_params = {
+            "calendarId": calendar_id,
+            "maxResults": 250,
+            "singleEvents": True,
+            "orderBy": "startTime",
+        }
+        if formatted_time_min:
+            request_params["timeMin"] = formatted_time_min
+        if formatted_time_max:
+            request_params["timeMax"] = formatted_time_max
+        if query:
+            request_params["q"] = query
+        if page_token:
+            request_params["pageToken"] = page_token
+
+        events_result = await asyncio.to_thread(
+            lambda: service.events().list(**request_params).execute()
+        )
+
+        items = events_result.get("items", [])
+        for item in items:
+            event_id = item.get("id")
+            if event_id:
+                all_event_ids.append(event_id)
+
+        page_count += 1
+        page_token = events_result.get("nextPageToken")
+        logger.info(
+            f"[bulk_delete_events] Page {page_count}: found {len(items)} events, "
+            f"total so far: {len(all_event_ids)}"
+        )
+
+        if not page_token:
+            break
+
+    if not all_event_ids:
+        return f"No events found matching the criteria in calendar '{calendar_id}'."
+
+    # Delete all events
+    deleted_count = 0
+    failed_count = 0
+
+    for event_id in all_event_ids:
+        try:
+            await asyncio.to_thread(
+                lambda eid=event_id: service.events().delete(
+                    calendarId=calendar_id, eventId=eid
+                ).execute()
+            )
+            deleted_count += 1
+        except Exception as e:
+            logger.warning(f"[bulk_delete_events] Failed to delete event {event_id}: {e}")
+            failed_count += 1
+
+    logger.info(
+        f"[bulk_delete_events] Done. Deleted: {deleted_count}, Failed: {failed_count}"
+    )
+
+    result = f"✅ Deleted {deleted_count} events from calendar '{calendar_id}'"
+    if query:
+        result += f" matching '{query}'"
+    if formatted_time_min or formatted_time_max:
+        time_range = []
+        if formatted_time_min:
+            time_range.append(f"from {formatted_time_min}")
+        if formatted_time_max:
+            time_range.append(f"until {formatted_time_max}")
+        result += f" ({', '.join(time_range)})"
+    if failed_count > 0:
+        result += f"\n⚠️ {failed_count} events could not be deleted."
+
+    return result

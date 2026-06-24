@@ -273,8 +273,20 @@ def _format_gmail_results_plain(messages: list, query: str, next_page_token: Opt
     lines = [
         f"Found {len(messages)} messages{estimate_info} matching '{query}':",
         "",
-        "📧 MESSAGES:",
     ]
+
+    # For large result sets, put a compact ALL-IDs block at the top so it
+    # survives AI context truncation. Without this, batch action tools
+    # (like batch_modify_gmail_message_labels) can't see all the IDs.
+    if len(messages) >= 50:
+        all_ids = [msg.get("id") for msg in messages if isinstance(msg, dict) and msg.get("id")]
+        lines.append(f"🔑 ALL MESSAGE IDS ({len(all_ids)} total, use these for batch actions):")
+        # Chunk into lines of 10 IDs for readability
+        for i in range(0, len(all_ids), 10):
+            lines.append(f"  {','.join(all_ids[i:i+10])}")
+        lines.append("")
+
+    lines.append("📧 MESSAGES:")
 
     for i, msg in enumerate(messages, 1):
         # Handle potential null/undefined message objects
@@ -1474,24 +1486,39 @@ async def modify_gmail_message_labels(
 async def batch_modify_gmail_message_labels(
     service,
     user_google_email: str,
-    message_ids: List[str],
-    add_label_ids: List[str] = Field(default=[], description="Label IDs to add to messages."),
-    remove_label_ids: List[str] = Field(default=[], description="Label IDs to remove from messages."),
+    message_ids: List[str] = Field(default=[], description="List of message IDs to modify. Leave empty if using query."),
+    query: Optional[str] = Field(default=None, description="Gmail search query to find messages to modify in bulk. When provided, the tool automatically searches, paginates, and modifies ALL matching messages. Use this for bulk operations instead of collecting IDs manually."),
+    add_label_ids: List[str] = Field(default=[], description="Label IDs to add to messages (e.g. ['TRASH'], ['STARRED'], ['Label_123'])."),
+    remove_label_ids: List[str] = Field(default=[], description="Label IDs to remove from messages (e.g. ['INBOX'], ['UNREAD'])."),
 ) -> str:
     """
-    Adds or removes labels from multiple Gmail messages in a single batch request.
+    Adds or removes labels from Gmail messages in bulk.
+
+    Two modes:
+    1. message_ids: Modify specific messages by ID (up to 1000).
+    2. query: Search and modify ALL matching messages automatically.
+       Handles pagination and batching internally — ideal for bulk operations
+       on hundreds or thousands of emails.
+
+    Examples:
+        - Trash all spam: query="category:spam", add_label_ids=["TRASH"]
+        - Archive old promos: query="category:promotions older_than:30d", remove_label_ids=["INBOX"]
+        - Trash by keyword: query="flame-straw", add_label_ids=["TRASH"]
+        - Label by sender: query="from:boss@company.com", add_label_ids=["Label_123"]
 
     Args:
         user_google_email (str): The user's Google email address. Required.
-        message_ids (List[str]): A list of message IDs to modify.
-        add_label_ids (Optional[List[str]]): List of label IDs to add to the messages.
-        remove_label_ids (Optional[List[str]]): List of label IDs to remove from the messages.
+        message_ids (List[str]): List of message IDs to modify. Leave empty if using query.
+        query (str, optional): Gmail search query. When provided, searches and modifies ALL matching messages.
+        add_label_ids (List[str]): Label IDs to add to the messages.
+        remove_label_ids (List[str]): Label IDs to remove from the messages.
 
     Returns:
-        str: Confirmation message of the label changes applied to the messages.
+        str: Confirmation with count of messages modified.
     """
     logger.info(
-        f"[batch_modify_gmail_message_labels] Invoked. Email: '{user_google_email}', Message IDs: '{message_ids}'"
+        f"[batch_modify_gmail_message_labels] Invoked. Email: '{user_google_email}', "
+        f"IDs: {len(message_ids)}, Query: '{query}'"
     )
 
     if not add_label_ids and not remove_label_ids:
@@ -1499,15 +1526,64 @@ async def batch_modify_gmail_message_labels(
             "At least one of add_label_ids or remove_label_ids must be provided."
         )
 
-    body = {"ids": message_ids}
-    if add_label_ids:
-        body["addLabelIds"] = add_label_ids
-    if remove_label_ids:
-        body["removeLabelIds"] = remove_label_ids
+    # MODE: Query-based bulk — tool handles pagination internally
+    if query:
+        logger.info(f"[batch_modify_gmail_message_labels] Query mode: '{query}'")
+        all_ids = []
+        page_token = None
+        page_count = 0
 
-    await asyncio.to_thread(
-        service.users().messages().batchModify(userId="me", body=body).execute
-    )
+        while True:
+            list_kwargs = {"userId": "me", "q": query, "maxResults": 500}
+            if page_token:
+                list_kwargs["pageToken"] = page_token
+
+            response = await asyncio.to_thread(
+                service.users().messages().list(**list_kwargs).execute
+            )
+
+            messages = response.get("messages", [])
+            if messages:
+                all_ids.extend(msg["id"] for msg in messages if msg.get("id"))
+
+            page_count += 1
+            page_token = response.get("nextPageToken")
+            logger.info(
+                f"[batch_modify_gmail_message_labels] Page {page_count}: "
+                f"found {len(messages)} messages, total so far: {len(all_ids)}"
+            )
+
+            if not page_token:
+                break
+
+        if not all_ids:
+            return f"No messages found matching query: '{query}'"
+
+        message_ids = all_ids
+
+    if not message_ids:
+        raise Exception("Either message_ids or query must be provided.")
+
+    # Execute in chunks of 1000 (Gmail API limit per batchModify call)
+    CHUNK_SIZE = 1000
+    total = len(message_ids)
+
+    for i in range(0, total, CHUNK_SIZE):
+        chunk = message_ids[i : i + CHUNK_SIZE]
+        body = {"ids": chunk}
+        if add_label_ids:
+            body["addLabelIds"] = add_label_ids
+        if remove_label_ids:
+            body["removeLabelIds"] = remove_label_ids
+
+        await asyncio.to_thread(
+            service.users().messages().batchModify(userId="me", body=body).execute
+        )
+
+        logger.info(
+            f"[batch_modify_gmail_message_labels] Chunk {i // CHUNK_SIZE + 1}: "
+            f"modified {len(chunk)} messages"
+        )
 
     actions = []
     if add_label_ids:
@@ -1515,4 +1591,6 @@ async def batch_modify_gmail_message_labels(
     if remove_label_ids:
         actions.append(f"Removed labels: {', '.join(remove_label_ids)}")
 
-    return f"Labels updated for {len(message_ids)} messages: {'; '.join(actions)}"
+    source = f"matching query '{query}'" if query else "by ID"
+    return f"✅ Labels updated for {total} messages {source}: {'; '.join(actions)}"
+
